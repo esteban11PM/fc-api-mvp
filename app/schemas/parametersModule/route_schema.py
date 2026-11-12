@@ -1,0 +1,113 @@
+from dataclasses import dataclass
+from datetime import time
+
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+
+from app.utils.enums.day_week import DayWeek
+from app.utils.helpers.schema_helper import partial_model
+from app.utils.schema_types import UpperText
+
+
+# Schema Base
+class RouteBase(BaseModel):
+    name: UpperText = Field(..., max_length=50, description="Nombre de la ruta")
+    days_week: list[DayWeek] = Field(
+        ...,
+        min_length=1,
+        description="Días en que sale la ruta (1 = lunes ... 7 = domingo)",
+    )
+    departure_time: time = Field(..., description="Hora de salida (HH:MM)")
+    active: bool = True
+
+    @field_validator("days_week")
+    @classmethod
+    def _unique_sorted_days(cls, value: list[DayWeek] | None) -> list[DayWeek] | None:
+        # [4, 1, 1] -> [1, 4]: sin repetidos y en orden de la semana
+        return sorted(set(value)) if value is not None else None
+
+    @field_serializer("days_week")
+    def _days_as_int(self, value: list[DayWeek] | None) -> list[int] | None:
+        # Enteros planos hacia la BD (SMALLINT[]) y en el JSON de respuesta
+        return [int(day) for day in value] if value is not None else None
+
+
+class RouteCreate(RouteBase):
+    pass
+
+
+@partial_model
+class RouteUpdate(RouteBase):
+    pass
+
+
+class RouteResponse(RouteBase):
+    id_route: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -----------------------------------------------------
+# Vista de Rutas: cards y gestión de clientes
+# -----------------------------------------------------
+class RouteCardResponse(RouteResponse):
+    clients_count: int = Field(..., description="Clientes activos asignados a la ruta")
+    client_names: list[str] = Field(
+        default_factory=list, description="Nombres de esos clientes, de la A a la Z"
+    )
+    zones: list[str] = Field(
+        default_factory=list, description="Zonas distintas de esos clientes, A-Z"
+    )
+
+
+class RouteClientAssign(BaseModel):
+    id_client: int = Field(..., gt=0, description="Cliente a asignar a la ruta")
+
+
+class RouteAvailableClientResponse(BaseModel):
+    """Cliente que se puede asignar a la ruta (registrado, activo y sin asignar)."""
+
+    id_client: int
+    name: str
+    phone: str | None
+    address: str | None
+    neighborhood_name: str
+    zone_name: str
+    special_prices_count: int = Field(
+        0,
+        description="Productos activos con precio especial: sin ellos no se le "
+        "pueden generar pedidos desde la ruta",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RouteClientResponse(BaseModel):
+    id_client_route: int
+    id_client: int
+    name: str
+    phone: str | None
+    address: str | None
+    neighborhood_name: str
+    zone_name: str
+    active: bool = Field(..., description="Estado del cliente")
+    special_prices_count: int = Field(
+        0,
+        description="Productos activos con precio especial: sin ellos no se le "
+        "pueden generar pedidos desde la ruta",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -----------------------------------------------------
+# Panel de administración (/routes/admin)
+# -----------------------------------------------------
+@dataclass(frozen=True)
+class RouteAdminFilters:
+    search: str | None = None  # nombre (contiene)
+    active: bool | None = None  # None = activas e inactivas
+    day: DayWeek | None = None  # rutas que salen ese día de la semana
+
+
+class RouteAdminRow(RouteResponse):
+    clients_count: int = Field(..., description="Clientes activos asignados")

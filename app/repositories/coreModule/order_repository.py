@@ -1,0 +1,468 @@
+from datetime import date
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import case, func, or_, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session, aliased, joinedload
+
+from app.core.timezone import BOGOTA_TZ, bogota_month_range
+from app.models.coreModule.client import Client
+from app.models.coreModule.daily_order_counter import DailyOrderCounter
+from app.models.coreModule.order import Order
+from app.models.coreModule.order_detail import OrderDetail
+from app.models.coreModule.product import Product
+from app.models.coreModule.user_vehicle import UserVehicle
+from app.models.parametersModule.neighborhood import Neighborhood
+from app.models.parametersModule.route import Route
+from app.models.parametersModule.zone import Zone
+from app.models.securityModule.person import Person
+from app.models.securityModule.user import User
+from app.models.securityModule.user_role import UserRole
+from app.repositories.base_repository import BaseRepository
+from app.repositories.pagination import order_clause
+from app.schemas.common.page_schema import PageParams
+from app.schemas.coreModule.order_history_schema import OrderHistoryFilters
+from app.schemas.coreModule.order_schema import OrderCreate, OrderUpdate
+from app.utils.enums.order_state import OrderState
+
+# Estados que se facturan en el cierre del día
+BILLABLE_STATES = (OrderState.DISPATCHED, OrderState.DELIVERED)
+
+
+class RepositoryOrder(BaseRepository[Order, OrderCreate, OrderUpdate]):
+    # Siguiente consecutivo del día de entrega `day`. Debe llamarse dentro de la
+    # misma transacción que inserta (o reprograma) el pedido: bloquea la fila del
+    # día hasta el commit y se revierte junto con ella.
+    def next_daily_number(self, db: Session, day: date) -> int:
+        stmt = (
+            insert(DailyOrderCounter)
+            .values(counter_date=day, last_value=1)
+            .on_conflict_do_update(
+                index_elements=[DailyOrderCounter.counter_date],
+                set_={"last_value": DailyOrderCounter.last_value + 1},
+            )
+            .returning(DailyOrderCounter.last_value)
+        )
+        return db.scalar(stmt)  # type: ignore
+
+    # Pedidos del día `day` generados desde la ruta, sin cancelados:
+    # {id_client: id_order}. Evita generar dos veces la misma ruta.
+    def get_route_orders_on(
+        self, db: Session, id_route: int, day: date
+    ) -> dict[int, int]:
+        stmt = select(Order.id_client, Order.id_order).where(
+            Order.id_route == id_route,
+            Order.state != OrderState.CANCELLED,
+            Order.delivery_date == day,
+        )
+        return {row.id_client: row.id_order for row in db.execute(stmt).all()}
+
+    # Varios pedidos bloqueados (SELECT ... FOR UPDATE) hasta el commit. Se bloquean
+    # en orden de id_order para que dos despachos simultáneos no se interbloqueen.
+    def get_many_for_update(self, db: Session, ids: list[int]) -> list[Order]:
+        stmt = (
+            select(Order)
+            .where(Order.id_order.in_(ids))
+            .order_by(Order.id_order)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list(db.scalars(stmt).all())
+
+    # Tabla principal: pedidos del día de entrega por gestionar (pendientes y cancelados)
+    def get_daily_summary(
+        self, db: Session, target_date: date, id_route: int | None = None
+    ) -> list[tuple]:
+        return self._summary_by_states(
+            db, target_date, (OrderState.PENDING, OrderState.CANCELLED), id_route
+        )
+
+    # Vista de despachados: pedidos del día que ya salieron (despachados y entregados)
+    def get_dispatched_summary(
+        self, db: Session, target_date: date, id_route: int | None = None
+    ) -> list[tuple]:
+        return self._summary_by_states(
+            db, target_date, (OrderState.DISPATCHED, OrderState.DELIVERED), id_route
+        )
+
+    # `id_route`: solo los pedidos generados desde esa ruta (un pedido individual
+    # del mismo cliente tiene id_route nulo y no entra)
+    def _summary_by_states(
+        self,
+        db: Session,
+        target_date: date,
+        states: tuple[OrderState, ...],
+        id_route: int | None = None,
+    ) -> list[tuple]:
+        # creation_datetime es TIMESTAMPTZ: se convierte a hora local de Bogotá
+        # antes de extraer la hora, sin depender de la zona de la sesión.
+        created_local = func.timezone(BOGOTA_TZ.key, Order.creation_datetime)
+        stmt = (
+            select(
+                Order.id_order,
+                Order.purchase_order,
+                func.to_char(created_local, "HH24:MI").label("creation_time"),
+                Order.estimated_delivery,
+                Client.name.label("client_name"),
+                Zone.name.label("zone_name"),
+                func.string_agg(Product.code, ", ").label("product_codes"),
+                func.sum(OrderDetail.cant).label("total_quantity"),
+                Order.state,
+                UserVehicle.code.label("driver_code"),
+                (Person.name + " " + Person.last_name).label(
+                    "driver_name"
+                ),  # Nombre concatenado separado del código
+                Order.id_route,
+                Route.name.label("route_name"),
+                Order.payment_method,
+                Order.invoice_type,
+                Order.has_receipt.label("has_receipt"),
+            )
+            .join(Client, Order.id_client == Client.id_client)
+            .join(Neighborhood, Client.id_neighborhood == Neighborhood.id_neighborhood)
+            .join(Zone, Neighborhood.id_zone == Zone.id_zone)
+            .join(OrderDetail, Order.id_order == OrderDetail.id_order)
+            .join(Product, OrderDetail.id_product == Product.id_product)
+            .outerjoin(
+                UserVehicle, Order.id_user_vehicle == UserVehicle.id_user_vehicle
+            )
+            .outerjoin(UserRole, UserVehicle.id_user_role == UserRole.id_user_role)
+            .outerjoin(User, UserRole.id_user == User.id_user)
+            .outerjoin(Person, User.id_person == Person.id_person)
+            .outerjoin(Route, Order.id_route == Route.id_route)
+            .where(
+                # 1. Filtrar solo los del día de entrega indicado (por defecto hoy)
+                Order.delivery_date == target_date,
+                # 2. Solo los estados que corresponden a la vista
+                Order.state.in_(states),
+            )
+            .group_by(
+                Order.id_order,
+                Client.name,
+                Zone.name,
+                UserVehicle.code,
+                Person.name,
+                Person.last_name,
+                Route.name,
+            )
+            # 3. Ordenar ascendente: el más antiguo arriba, el último registrado al final
+            .order_by(Order.creation_datetime.asc())
+        )
+        if id_route is not None:
+            stmt = stmt.where(Order.id_route == id_route)
+        return list(db.execute(stmt).all())
+
+    # ------------------------------------------------------------------
+    # Vista Histórico
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _history_conditions(filters: OrderHistoryFilters) -> list:
+        conditions = [Order.delivery_date.between(filters.date_from, filters.date_to)]
+        if filters.state is not None:
+            conditions.append(Order.state == filters.state)  # type: ignore
+        if filters.id_route is not None:
+            conditions.append(Order.id_route == filters.id_route)  # type: ignore
+        if filters.id_user_vehicle is not None:
+            conditions.append(Order.id_user_vehicle == filters.id_user_vehicle)  # type: ignore
+        if filters.payment_method is not None:
+            conditions.append(Order.payment_method == filters.payment_method)  # type: ignore
+        if filters.invoice_type is not None:
+            conditions.append(Order.invoice_type == filters.invoice_type)  # type: ignore
+        if filters.search:
+            term = filters.search.strip()
+            conditions.append(
+                or_(Client.name.ilike(f"%{term}%"), Order.purchase_order == term)  # type: ignore
+            )
+        return conditions
+
+    # Cantidad de pedidos y ventas (sin cancelados) del filtro completo
+    def get_history_totals(
+        self, db: Session, filters: OrderHistoryFilters
+    ) -> tuple[int, Decimal]:
+        sales = func.coalesce(
+            func.sum(
+                case(
+                    (Order.state != OrderState.CANCELLED, Order.order_total),
+                    else_=0,
+                )
+            ),
+            0,
+        )
+        stmt = (
+            select(func.count(Order.id_order), sales)
+            .join(Client, Client.id_client == Order.id_client)
+            .where(*self._history_conditions(filters))
+        )
+        count, total = db.execute(stmt).one()
+        return count, Decimal(total)
+
+    # Una página del histórico, del más reciente al más antiguo
+    def get_history_page(
+        self, db: Session, filters: OrderHistoryFilters, params: PageParams
+    ) -> list[tuple]:
+        # Productos agregados por pedido en una subconsulta: la paginación se
+        # hace sobre pedidos, no sobre renglones de detalle.
+        details = (
+            select(
+                OrderDetail.id_order,
+                func.string_agg(Product.code, ", ").label("product_codes"),
+                func.sum(OrderDetail.cant).label("total_quantity"),
+            )
+            .join(Product, Product.id_product == OrderDetail.id_product)
+            .group_by(OrderDetail.id_order)
+            .subquery()
+        )
+        created_local = func.timezone(BOGOTA_TZ.key, Order.creation_datetime)
+        stmt = (
+            select(
+                Order.id_order,
+                Order.purchase_order,
+                Order.delivery_date.label("order_date"),
+                func.to_char(created_local, "HH24:MI").label("creation_time"),
+                Client.name.label("client_name"),
+                Zone.name.label("zone_name"),
+                Route.name.label("route_name"),
+                func.coalesce(details.c.product_codes, "").label("product_codes"),
+                func.coalesce(details.c.total_quantity, 0).label("total_quantity"),
+                Order.order_total,
+                UserVehicle.code.label("driver_code"),
+                (Person.name + " " + Person.last_name).label("driver_name"),
+                Order.state,
+                Order.payment_method,
+                Order.invoice_type,
+            )
+            .join(Client, Client.id_client == Order.id_client)
+            .join(Neighborhood, Neighborhood.id_neighborhood == Client.id_neighborhood)
+            .join(Zone, Zone.id_zone == Neighborhood.id_zone)
+            .outerjoin(details, details.c.id_order == Order.id_order)
+            .outerjoin(Route, Route.id_route == Order.id_route)
+            .outerjoin(
+                UserVehicle, UserVehicle.id_user_vehicle == Order.id_user_vehicle
+            )
+            .outerjoin(UserRole, UserRole.id_user_role == UserVehicle.id_user_role)
+            .outerjoin(User, User.id_user == UserRole.id_user)
+            .outerjoin(Person, Person.id_person == User.id_person)
+            .where(*self._history_conditions(filters))
+            # Por defecto del más antiguo al más nuevo (día de entrega y hora en
+            # que se tomó); sort_dir=desc lo invierte
+            .order_by(
+                *order_clause(
+                    params,
+                    {
+                        "date": (Order.delivery_date, Order.creation_datetime),
+                        "purchase_order": (Order.delivery_date, Order.purchase_order),
+                        "client_name": Client.name,
+                        "zone_name": Zone.name,
+                        "route_name": Route.name,
+                        "total_quantity": "total_quantity",
+                        "total": Order.order_total,
+                        "driver_name": (Person.name, Person.last_name),
+                        "state": Order.state,
+                        "payment_method": Order.payment_method,
+                        "invoice_type": Order.invoice_type,
+                    },
+                    default=[Order.delivery_date, Order.creation_datetime],
+                    tiebreak=Order.id_order,
+                )
+            )
+            .offset(params.offset)
+            .limit(params.page_size)
+        )
+        return list(db.execute(stmt).all())
+
+    # ------------------------------------------------------------------
+    # Archivado mensual: una fila por producto vendido del mes
+    # ------------------------------------------------------------------
+    def get_month_export_rows(self, db: Session, year: int, month: int) -> list[tuple]:
+        start, end = bogota_month_range(year, month)
+        created_local = func.timezone(BOGOTA_TZ.key, Order.creation_datetime)
+        DriverUser = aliased(User)
+        DriverPerson = aliased(Person)
+        TakerUser = aliased(User)
+        TakerPerson = aliased(Person)
+        stmt = (
+            select(
+                Order.id_order,
+                Order.delivery_date.label("order_date"),
+                func.to_char(created_local, "HH24:MI").label("creation_time"),
+                Order.purchase_order,
+                Client.name.label("client_name"),
+                Client.phone.label("client_phone"),
+                Neighborhood.name.label("neighborhood_name"),
+                Zone.name.label("zone_name"),
+                Route.name.label("route_name"),
+                UserVehicle.code.label("driver_code"),
+                (DriverPerson.name + " " + DriverPerson.last_name).label("driver_name"),
+                (TakerPerson.name + " " + TakerPerson.last_name).label("taker_name"),
+                Order.state,
+                Order.dispatch_time,
+                Order.delivery_time,
+                Product.code.label("product_code"),
+                Product.name.label("product_name"),
+                OrderDetail.cant,
+                OrderDetail.unit_price,
+                OrderDetail.subtotal,
+                Order.order_total,
+                Order.payment_method,
+                Order.invoice_type,
+                Order.observations,
+                Order.cancel_reason,
+            )
+            .join(OrderDetail, OrderDetail.id_order == Order.id_order)
+            .join(Product, Product.id_product == OrderDetail.id_product)
+            .join(Client, Client.id_client == Order.id_client)
+            .join(Neighborhood, Neighborhood.id_neighborhood == Client.id_neighborhood)
+            .join(Zone, Zone.id_zone == Neighborhood.id_zone)
+            .join(TakerUser, TakerUser.id_user == Order.id_user_taker)
+            .join(TakerPerson, TakerPerson.id_person == TakerUser.id_person)
+            .outerjoin(Route, Route.id_route == Order.id_route)
+            .outerjoin(
+                UserVehicle, UserVehicle.id_user_vehicle == Order.id_user_vehicle
+            )
+            .outerjoin(UserRole, UserRole.id_user_role == UserVehicle.id_user_role)
+            .outerjoin(DriverUser, DriverUser.id_user == UserRole.id_user)
+            .outerjoin(DriverPerson, DriverPerson.id_person == DriverUser.id_person)
+            # Mes de la fecha de entrega: el mismo criterio del cierre y la purga
+            .where(
+                Order.delivery_date >= start.date(), Order.delivery_date < end.date()
+            )
+            .order_by(
+                Order.delivery_date,
+                Order.creation_datetime,
+                Order.id_order,
+                Product.code,
+            )
+        )
+        return list(db.execute(stmt).all())
+
+    # ------------------------------------------------------------------
+    # Vista Cierre: pedidos facturables del día (despachados y entregados)
+    # ------------------------------------------------------------------
+    # Cantidad de pedidos del día por estado (todos los estados, para las cards)
+    def count_by_state_on_day(self, db: Session, day: date) -> dict[OrderState, int]:
+        stmt = (
+            select(Order.state, func.count(Order.id_order))
+            .where(Order.delivery_date == day)
+            .group_by(Order.state)
+        )
+        return {state: count for state, count in db.execute(stmt).all()}
+
+    # Pedidos facturables del día con sus renglones: una fila por renglón, en orden
+    # de pedido. Es la única fuente del cierre: el consolidado, las otras
+    # facturas, el cuadre, el resumen y la huella se arman con estas mismas filas.
+    def get_billable_order_lines(self, db: Session, day: date) -> list[Any]:
+        stmt = (
+            select(
+                Order.id_order,
+                Order.purchase_order,
+                Order.state,
+                Order.payment_method,
+                Order.invoice_type,
+                Order.order_total,
+                Order.id_user_vehicle,
+                Client.name.label("client_name"),
+                OrderDetail.id_order_detail,
+                Product.id_product,
+                Product.code.label("product_code"),
+                Product.name.label("product_name"),
+                OrderDetail.cant,
+                OrderDetail.unit_price,
+                OrderDetail.subtotal,
+            )
+            .join(Client, Client.id_client == Order.id_client)
+            .join(OrderDetail, OrderDetail.id_order == Order.id_order)
+            .join(Product, Product.id_product == OrderDetail.id_product)
+            .where(
+                Order.delivery_date == day,
+                Order.state.in_(BILLABLE_STATES),
+            )
+            .order_by(Order.id_order, OrderDetail.id_order_detail)
+        )
+        return list(db.execute(stmt).all())
+
+    # Días del mes (por día de entrega) que tienen pedidos facturables
+    def get_billable_days(self, db: Session, month: date) -> list[date]:
+        start, end = bogota_month_range(month.year, month.month)
+        stmt = (
+            select(Order.delivery_date)
+            .where(
+                Order.delivery_date >= start.date(),
+                Order.delivery_date < end.date(),
+                Order.state.in_(BILLABLE_STATES),
+            )
+            .distinct()
+            .order_by(Order.delivery_date)
+        )
+        return list(db.scalars(stmt).all())
+
+    # Pedidos del día que se despacharon y después se cancelaron (devoluciones):
+    # listado informativo del cierre, no suman.
+    def get_cancelled_after_dispatch(self, db: Session, day: date) -> list[Any]:
+        Canceller = aliased(User)
+        CancellerPerson = aliased(Person)
+        stmt = (
+            select(
+                Order.id_order,
+                Order.purchase_order,
+                Order.id_user_vehicle,
+                UserVehicle.code.label("driver_code"),
+                (Person.name + " " + Person.last_name).label("driver_name"),
+                Client.name.label("client_name"),
+                Order.payment_method,
+                Order.invoice_type,
+                Order.order_total,
+                Order.cancel_reason,
+                Order.cancel_note,
+                Order.cancelled_at,
+                (CancellerPerson.name + " " + CancellerPerson.last_name).label(
+                    "canceller_name"
+                ),
+            )
+            .join(Client, Client.id_client == Order.id_client)
+            .outerjoin(
+                UserVehicle, UserVehicle.id_user_vehicle == Order.id_user_vehicle
+            )
+            .outerjoin(UserRole, UserRole.id_user_role == UserVehicle.id_user_role)
+            .outerjoin(User, User.id_user == UserRole.id_user)
+            .outerjoin(Person, Person.id_person == User.id_person)
+            .outerjoin(Canceller, Canceller.id_user == Order.id_user_canceller)
+            .outerjoin(
+                CancellerPerson, CancellerPerson.id_person == Canceller.id_person
+            )
+            .where(
+                Order.delivery_date == day,
+                Order.state == OrderState.CANCELLED,
+                Order.dispatch_time.is_not(None),
+            )
+            .order_by(Order.purchase_order, Order.id_order)
+        )
+        return list(db.execute(stmt).all())
+
+    # Obtiene los detalles de un pedido
+    def get_order_with_full_relations(self, db: Session, id_order: int) -> Order | None:
+        stmt = (
+            select(Order)
+            .options(
+                joinedload(Order.client)
+                .joinedload(Client.neighborhood)
+                .joinedload(Neighborhood.zone),
+                joinedload(Order.order_details).joinedload(OrderDetail.product),
+                joinedload(Order.user_vehicle)
+                .joinedload(UserVehicle.user_role)
+                .joinedload(UserRole.user)
+                .joinedload(User.person),
+                # Auditoría: quién lo tomó, quién editó los productos y quién lo
+                # canceló (SQLAlchemy usa un alias distinto para cada usuario)
+                joinedload(Order.user_taker).joinedload(User.person),
+                joinedload(Order.user_items_updater).joinedload(User.person),
+                joinedload(Order.user_canceller).joinedload(User.person),
+                joinedload(Order.route),
+            )
+            .where(Order.id_order == id_order)
+        )
+        return db.scalar(stmt)
+
+
+# Intancia del repositorio inyectando el modelo ORM
+order_repository = RepositoryOrder(Order)

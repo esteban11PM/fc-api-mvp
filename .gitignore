@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Entornos virtuales
+venv/
+.env
+.venv/
+
+# Variables de entorno y secretos
+app/.env
+app/.env.*
+
+# IDEs / Editores
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/mcp.json
+.history/*
+.idea/
+*.swp
+
+# Logs y bases de datos locales (si aplicara)
+*.log
+*.sqlite
+
+# Otros
+*.txt
+!requirements*.txt
+*.zip
+
+# Llaves de Google (cuenta de servicio)
+credentials/

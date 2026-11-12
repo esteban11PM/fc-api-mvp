@@ -1,0 +1,1019 @@
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.core.timezone import BOGOTA_TZ, today_bogota
+from app.models.coreModule.order import Order
+from app.repositories.coreModule.client_repository import client_repository
+from app.repositories.coreModule.order_detail_repository import order_detail_repository
+from app.repositories.coreModule.order_repository import order_repository
+from app.repositories.coreModule.product_repository import product_repository
+from app.repositories.coreModule.special_customer_price_repository import (
+    special_customer_price_repository,
+)
+from app.repositories.coreModule.user_vehicle_repository import user_vehicle_repository
+from app.repositories.parametersModule.neighborhood_repository import (
+    neighborhood_repository,
+)
+from app.repositories.parametersModule.route_repository import route_repository
+from app.schemas.common.page_schema import PageParams, SortDirection
+from app.schemas.coreModule.order_history_schema import (
+    OrderHistoryFilters,
+    OrderHistoryPage,
+    OrderHistoryRow,
+)
+from app.schemas.coreModule.order_schema import (
+    OrderCancelRequest,
+    OrderCreate,
+    OrderCreateExistingClient,
+    OrderCreateNewClient,
+    OrderDetailItemModal,
+    OrderFullDetailResponse,
+    OrderItemInput,
+    OrderItemSync,
+    OrderSummaryResponse,
+    OrderUpdate,
+)
+from app.schemas.coreModule.route_order_schema import (
+    RouteOfDayResponse,
+    RouteOrderItemInput,
+    RouteOrdersCreate,
+    RouteOrderTemplateResponse,
+    RouteTemplateClient,
+    RouteTemplateProduct,
+)
+from app.services.base_service import BaseService
+from app.utils.enums.invoice_type import InvoiceType
+from app.utils.enums.order_state import OrderState
+from app.utils.enums.payment_method import PaymentMethod
+from app.utils.exceptions.business_exceptions import (
+    BusinessError,
+    BusinessRuleViolationError,
+    BusinessValidationError,
+    ConflictError,
+    EntityNotFoundError,
+)
+
+# purchase_order es String(3): consecutivo diario de 001 a 999
+MAX_DAILY_ORDERS = 999
+# Cuántos días hacia adelante se puede programar un pedido
+MAX_SCHEDULE_DAYS = 60
+
+
+class OrderService(BaseService[Order, OrderCreate, OrderUpdate]):
+    def __init__(self):
+        super().__init__(repository=order_repository, entity_name="Pedido")
+
+    # Tabla principal: pedidos del día en PENDING y CANCELLED
+    def get_dashboard_summary(
+        self, db: Session, target_date: date, id_route: int | None = None
+    ) -> list[OrderSummaryResponse]:
+        return self._to_summary(
+            order_repository.get_daily_summary(db, target_date, id_route)
+        )
+
+    # Vista de despachados: pedidos del día en DISPATCHED y DELIVERED
+    def get_dispatched_summary(
+        self, db: Session, target_date: date, id_route: int | None = None
+    ) -> list[OrderSummaryResponse]:
+        return self._to_summary(
+            order_repository.get_dispatched_summary(db, target_date, id_route)
+        )
+
+    @staticmethod
+    def _to_summary(rows: list) -> list[OrderSummaryResponse]:
+        return [
+            OrderSummaryResponse(
+                id_order=row.id_order,
+                purchase_order=row.purchase_order,
+                creation_time=row.creation_time,
+                estimated_delivery=row.estimated_delivery,
+                client_name=row.client_name,
+                zone_name=row.zone_name,
+                product_codes=row.product_codes,
+                total_quantity=row.total_quantity,
+                driver_code=row.driver_code,
+                driver_name=row.driver_name,
+                state=row.state,
+                id_route=row.id_route,
+                route_name=row.route_name,
+                payment_method=row.payment_method,
+                invoice_type=row.invoice_type,
+                has_receipt=row.has_receipt,
+            )
+            for row in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Vista Histórico
+    # ------------------------------------------------------------------
+    def get_history(
+        self,
+        db: Session,
+        *,
+        date_from: date | None,
+        date_to: date | None,
+        state: OrderState | None,
+        id_route: int | None,
+        id_user_vehicle: int | None,
+        search: str | None,
+        page: int,
+        page_size: int,
+        payment_method: PaymentMethod | None = None,
+        invoice_type: InvoiceType | None = None,
+        sort_by: str | None = None,
+        sort_dir: SortDirection = "asc",
+    ) -> OrderHistoryPage:
+        today = today_bogota()
+        # Por defecto: desde el 1 del mes anterior (lo que retiene la BD) hasta hoy
+        first_of_month = today.replace(day=1)
+        default_from = (first_of_month - timedelta(days=1)).replace(day=1)
+        filters = OrderHistoryFilters(
+            date_from=date_from or default_from,
+            date_to=date_to or today,
+            state=state,
+            id_route=id_route,
+            id_user_vehicle=id_user_vehicle,
+            search=search.strip() if search and search.strip() else None,
+            payment_method=payment_method,
+            invoice_type=invoice_type,
+        )
+        if filters.date_from > filters.date_to:
+            raise BusinessValidationError(
+                "La fecha inicial no puede ser posterior a la final.",
+                field="date_from",
+                code="INVALID_DATE_RANGE",
+            )
+
+        total, total_sales = order_repository.get_history_totals(db, filters)
+        params = PageParams(
+            page=page, page_size=page_size, sort_by=sort_by, sort_dir=sort_dir
+        )
+        rows = order_repository.get_history_page(db, filters, params)
+        return OrderHistoryPage(
+            date_from=filters.date_from,
+            date_to=filters.date_to,
+            page=page,
+            page_size=page_size,
+            total=total,
+            pages=-(-total // page_size),  # división hacia arriba
+            total_sales=total_sales,
+            items=[
+                OrderHistoryRow.model_validate(row, from_attributes=True)
+                for row in rows
+            ],
+        )
+
+    # Obtiene los detalles de un pedido
+    def get_full_detail(self, db: Session, id_order: int) -> OrderFullDetailResponse:
+        order = order_repository.get_order_with_full_relations(db, id_order)
+        if not order:
+            raise EntityNotFoundError("Pedido", id_order)
+
+        # El conductor es opcional: un pedido puede despacharse sin asignar
+        driver_code: str | None = None
+        driver_name: str | None = None
+        if order.user_vehicle:
+            driver_code = order.user_vehicle.code
+            person = order.user_vehicle.user_role.user.person
+            driver_name = f"{person.name} {person.last_name}"
+
+        items = [
+            OrderDetailItemModal(
+                id_order_detail=detail.id_order_detail,
+                id_product=detail.id_product,
+                product_code=detail.product.code,
+                product_name=detail.product.name,
+                product_active=detail.product.active,
+                cant=detail.cant,
+                unit_price=detail.unit_price,
+                subtotal=detail.subtotal,
+            )
+            for detail in order.order_details
+        ]
+
+        created = order.creation_datetime.astimezone(BOGOTA_TZ)
+        return OrderFullDetailResponse(
+            id_order=order.id_order,
+            purchase_order=order.purchase_order,
+            creation_datetime=created,
+            creation_date=created.date(),
+            creation_time=created.strftime("%H:%M"),
+            delivery_date=order.delivery_date,
+            estimated_delivery=order.estimated_delivery,
+            dispatch_time=order.dispatch_time,
+            delivery_time=order.delivery_time,
+            state=order.state,
+            order_total=order.order_total,  # type: ignore
+            id_client=order.id_client,
+            client_name=order.client.name,
+            client_phone=order.client.phone,
+            client_address=order.client.address,
+            neighborhood_name=order.client.neighborhood.name,
+            zone_name=order.client.neighborhood.zone.name,
+            id_user_vehicle=order.id_user_vehicle,
+            driver_code=driver_code,
+            driver_name=driver_name,
+            payment_method=order.payment_method,
+            invoice_type=order.invoice_type,
+            has_receipt=order.has_receipt,
+            observations=order.observations,
+            id_route=order.id_route,
+            route_name=order.route.name if order.route else None,
+            taker_name=_person_name(order.user_taker),  # type: ignore[arg-type]
+            items_updater_name=_person_name(order.user_items_updater),
+            items_updated_at=_in_bogota(order.items_updated_at),
+            cancel_reason=order.cancel_reason,
+            cancel_note=order.cancel_note,
+            cancelled_at=_in_bogota(order.cancelled_at),
+            canceller_name=_person_name(order.user_canceller),
+            items=items,
+        )
+
+    # Creacion de pedido para un cliente nuevo
+    def create_for_new_client(
+        self, db: Session, *, obj_in: OrderCreateNewClient, id_user_taker: int
+    ) -> Order:
+        self._ensure_reference(
+            db,
+            neighborhood_repository,
+            obj_in.client.id_neighborhood,
+            field="id_neighborhood",
+            label="Barrio",
+        )
+        self._validate_items(db, obj_in.items)
+        # Valida fecha y factura antes de crear el cliente temporal
+        self._resolve_delivery_date(obj_in.delivery_date)
+        invoice_type = self._resolve_invoice_type(
+            obj_in.invoice_type, is_registered=False, requires_electronic=False
+        )
+
+        client = client_repository.add(
+            db, obj_in_data={**obj_in.client.model_dump(), "is_registered": False}
+        )
+        return self._create_order_with_items(
+            db,
+            id_client=client.id_client,
+            id_user_taker=id_user_taker,
+            order_in=obj_in,
+            invoice_type=invoice_type,
+        )
+
+    # Creacion de pedido para un cliente existente
+    def create_for_existing_client(
+        self, db: Session, *, obj_in: OrderCreateExistingClient, id_user_taker: int
+    ) -> Order:
+        self._ensure_reference(
+            db, client_repository, obj_in.id_client, field="id_client", label="Cliente"
+        )
+        client = client_repository.get(db, obj_in.id_client)
+        if not client.is_registered:  # type: ignore
+            raise BusinessValidationError(
+                "Solo se pueden tomar pedidos de clientes registrados en este flujo.",
+                field="id_client",
+                code="CLIENT_NOT_REGISTERED",
+            )
+        self._validate_items(db, obj_in.items)
+        invoice_type = self._resolve_invoice_type(
+            obj_in.invoice_type,
+            is_registered=True,
+            requires_electronic=client.requires_electronic_invoice,  # type: ignore
+        )
+        return self._create_order_with_items(
+            db,
+            id_client=obj_in.id_client,
+            id_user_taker=id_user_taker,
+            order_in=obj_in,
+            invoice_type=invoice_type,
+        )
+
+    # Creacion de pedido directa a OrderDetail (un pedido, con commit)
+    def _create_order_with_items(
+        self, db: Session, *, id_client, id_user_taker, order_in, invoice_type
+    ) -> Order:
+        delivery_date = self._resolve_delivery_date(order_in.delivery_date)
+        if order_in.id_user_vehicle is not None:
+            self._ensure_vehicle(db, order_in.id_user_vehicle)
+
+        order = self._add_order_with_items(
+            db,
+            id_client=id_client,
+            id_user_taker=id_user_taker,
+            items=order_in.items,
+            delivery_date=delivery_date,
+            estimated_delivery=order_in.estimated_delivery,
+            id_user_vehicle=order_in.id_user_vehicle,
+            payment_method=order_in.payment_method,
+            invoice_type=invoice_type,
+            observations=order_in.observations,
+        )
+        db.commit()
+        db.refresh(order)
+        return order
+
+    # Día de entrega pedido: hoy si no viene; si viene, entre hoy y hoy + 60 días
+    # (hora de Bogotá). Se valida aquí porque "hoy" depende de la zona horaria.
+    @staticmethod
+    def _resolve_delivery_date(requested: date | None) -> date:
+        today = today_bogota()
+        if requested is None:
+            return today
+        if requested < today:
+            raise BusinessValidationError(
+                "El día de entrega no puede ser anterior a hoy.",
+                field="delivery_date",
+                code="DELIVERY_DATE_IN_PAST",
+            )
+        if requested > today + timedelta(days=MAX_SCHEDULE_DAYS):
+            raise BusinessValidationError(
+                f"Solo se pueden programar pedidos hasta {MAX_SCHEDULE_DAYS} días "
+                "adelante.",
+                field="delivery_date",
+                code="DELIVERY_DATE_TOO_FAR",
+            )
+        return requested
+
+    # Tipo de factura del pedido. Sin valor: la del cliente (se copia al pedido;
+    # un cambio posterior en el cliente no altera los pedidos ya tomados). Un
+    # cliente temporal siempre factura POS.
+    @staticmethod
+    def _resolve_invoice_type(
+        requested: InvoiceType | None, *, is_registered: bool, requires_electronic: bool
+    ) -> InvoiceType:
+        if requested is None:
+            return InvoiceType.ELECTRONIC if requires_electronic else InvoiceType.POS
+        if requested == InvoiceType.ELECTRONIC and not is_registered:
+            raise BusinessValidationError(
+                "Un cliente temporal (sin registrar) solo admite factura POS. "
+                "Regístralo en el panel para hacerle factura electrónica.",
+                field="invoice_type",
+                code="ELECTRONIC_INVOICE_NOT_ALLOWED",
+            )
+        return requested
+
+    # Domiciliario (asignación domiciliario + vehículo) que se le asigna a un pedido:
+    # debe existir y estar activa, igual que su vehículo y su domiciliario. Se valida
+    # al crear y al reasignar; un pedido que ya lo tenía lo conserva aunque después
+    # se desactive (se despacha y se factura igual).
+    @staticmethod
+    def _ensure_vehicle(db: Session, id_user_vehicle: int) -> None:
+        status = user_vehicle_repository.get_assignment_status(db, id_user_vehicle)
+        if status is None:
+            raise BusinessValidationError(
+                f"Vehículo con ID {id_user_vehicle} no existe.",
+                field="id_user_vehicle",
+            )
+        problem = None
+        if not status.active:
+            problem = "Esta asignación de domiciliario y vehículo está inactiva."
+        elif not status.vehicle_active:
+            problem = f"El vehículo {status.vehicle_name} está inactivo."
+        elif not status.driver_active:
+            problem = f"El domiciliario {status.driver_name} está inactivo."
+        if problem:
+            raise BusinessValidationError(
+                f"{problem} Elige otro domiciliario.",
+                field="id_user_vehicle",
+                code="REFERENCE_INACTIVE",
+            )
+
+    # Inserta pedido + detalles SIN commit (flush): lo usan la creación
+    # individual y la creación en lote por ruta, que confirma todo al final.
+    def _add_order_with_items(
+        self,
+        db: Session,
+        *,
+        id_client: int,
+        id_user_taker: int,
+        items: list[OrderItemInput],
+        delivery_date: date,
+        estimated_delivery=None,
+        id_user_vehicle: int | None = None,
+        id_route: int | None = None,
+        payment_method: PaymentMethod = PaymentMethod.CASH,
+        invoice_type: InvoiceType = InvoiceType.POS,
+        observations: str | None = None,
+    ) -> Order:
+        order = order_repository.add(
+            db,
+            obj_in_data={
+                "purchase_order": self._next_purchase_order(db, delivery_date),
+                "delivery_date": delivery_date,
+                "estimated_delivery": estimated_delivery,
+                "id_client": id_client,
+                "id_user_vehicle": id_user_vehicle,
+                "id_user_taker": id_user_taker,
+                "id_route": id_route,
+                "payment_method": payment_method,
+                "invoice_type": invoice_type,
+                "observations": observations,
+            },
+        )
+
+        total = Decimal(0)
+        for item in items:
+            subtotal = item.unit_price * item.cant
+            order_detail_repository.add(
+                db,
+                obj_in_data={
+                    "id_order": order.id_order,
+                    "id_product": item.id_product,
+                    "cant": item.cant,
+                    "unit_price": item.unit_price,
+                    "subtotal": subtotal,
+                },
+            )
+            total += subtotal
+
+        order.order_total = total
+        db.add(order)
+        db.flush()
+        return order
+
+    # ------------------------------------------------------------------
+    # Pedidos por ruta
+    # ------------------------------------------------------------------
+
+    # Rutas activas que salen ese día de la semana
+    def get_routes_of_day(
+        self, db: Session, target_date: date
+    ) -> list[RouteOfDayResponse]:
+        rows = route_repository.get_routes_of_day(
+            db, target_date.isoweekday(), target_date
+        )
+        summary = route_repository.get_clients_summary(
+            db, [route.id_route for route, _, _ in rows], registered_only=True
+        )
+        return [
+            RouteOfDayResponse(
+                id_route=route.id_route,
+                name=route.name,
+                departure_time=route.departure_time,
+                days_week=route.days_week,
+                clients_count=clients_count,
+                client_names=summary.get(route.id_route, ([], []))[0],
+                zones=summary.get(route.id_route, ([], []))[1],
+                orders_count=orders_count,
+            )
+            for route, clients_count, orders_count in rows
+        ]
+
+    # Precarga: por cada cliente de la ruta, sus productos con precio especial
+    # (cantidad sugerida 1). Un cliente sin precios especiales llega con
+    # products=[]: aparece en el formulario, pero no se le genera pedido.
+    def get_route_template(
+        self, db: Session, id_route: int
+    ) -> RouteOrderTemplateResponse:
+        route = route_repository.get(db, id_route)
+        if route is None:
+            raise EntityNotFoundError("Ruta", id_route)
+
+        clients = route_repository.get_orderable_clients(db, id_route)
+        products_by_client: dict[int, list[RouteTemplateProduct]] = {}
+        for row in special_customer_price_repository.get_products_for_clients(
+            db,
+            [c.id_client for c in clients],  # type: ignore
+        ):
+            products_by_client.setdefault(row.id_client, []).append(  # type: ignore
+                RouteTemplateProduct(
+                    id_product=row.id_product,  # type: ignore
+                    code=row.code,  # type: ignore
+                    name=row.name,  # type: ignore
+                    unit_price=row.agreed_price,  # type: ignore
+                )  # type: ignore
+            )
+        existing = order_repository.get_route_orders_on(db, id_route, today_bogota())
+
+        return RouteOrderTemplateResponse(
+            id_route=route.id_route,
+            name=route.name,
+            departure_time=route.departure_time,
+            clients=[
+                RouteTemplateClient(
+                    id_client=c.id_client,  # type: ignore
+                    name=c.name,  # type: ignore
+                    phone=c.phone,  # type: ignore
+                    address=c.address,  # type: ignore
+                    neighborhood_name=c.neighborhood_name,  # type: ignore
+                    zone_name=c.zone_name,  # type: ignore
+                    requires_electronic_invoice=c.requires_electronic_invoice,  # type: ignore
+                    products=products_by_client.get(c.id_client, []),  # type: ignore
+                    existing_order_id=existing.get(c.id_client),  # type: ignore
+                )
+                for c in clients
+            ],
+        )
+
+    # Crea en UNA transacción los pedidos de los clientes de la ruta que vienen
+    # con productos. Si cualquiera falla, no se crea ninguno.
+    def create_for_route(
+        self,
+        db: Session,
+        *,
+        id_route: int,
+        obj_in: RouteOrdersCreate,
+        id_user_taker: int,
+    ) -> list[Order]:
+        # Bloquea la ruta: dos gestores generando la misma ruta a la vez no
+        # pueden duplicar pedidos (el segundo espera y ve los del primero).
+        route = route_repository.get_for_update(db, id_route)
+        if route is None:
+            raise EntityNotFoundError("Ruta", id_route)
+        if not route.active:
+            raise BusinessValidationError(
+                "La ruta está inactiva.", field="id_route", code="ROUTE_INACTIVE"
+            )
+
+        client_ids = [o.id_client for o in obj_in.orders]
+        repeated = sorted({i for i in client_ids if client_ids.count(i) > 1})
+        if repeated:
+            raise BusinessValidationError(
+                f"Cliente repetido en la lista (ID: {_ids(repeated)}).",
+                field="id_client",
+                code="DUPLICATE_CLIENT",
+            )
+
+        # {id_client: requiere factura electrónica} de los clientes de la ruta
+        orderable = {
+            c.id_client: c.requires_electronic_invoice  # type: ignore
+            for c in route_repository.get_orderable_clients(db, id_route)  # type: ignore
+        }
+        outside = [i for i in client_ids if i not in orderable]
+        if outside:
+            raise BusinessValidationError(
+                "Estos clientes no están asignados a la ruta o no están activos "
+                f"(ID: {_ids(outside)}).",
+                field="id_client",
+                code="CLIENT_NOT_IN_ROUTE",
+            )
+
+        today = today_bogota()
+        existing = order_repository.get_route_orders_on(db, id_route, today)
+        already = [i for i in client_ids if i in existing]
+        if already:
+            raise ConflictError(
+                "Estos clientes ya tienen pedido de hoy desde esta ruta "
+                f"(ID: {_ids(already)}). Edítalo en lugar de crear otro.",
+                field="id_client",
+                code="ROUTE_ORDER_EXISTS",
+            )
+
+        if obj_in.id_user_vehicle is not None:
+            self._ensure_vehicle(db, obj_in.id_user_vehicle)
+
+        # El precio NO viene del frontend: es el especial pactado de cada cliente
+        agreed = {
+            (row.id_client, row.id_product): row.agreed_price  # type: ignore
+            for row in special_customer_price_repository.get_products_for_clients(
+                db, client_ids
+            )
+        }
+        items_by_client: dict[int, list[OrderItemInput]] = {}
+        for client_order in obj_in.orders:
+            try:
+                items_by_client[client_order.id_client] = self._priced_route_items(
+                    client_order.id_client, client_order.items, agreed
+                )
+            except BusinessError as error:
+                # Indica a qué cliente pertenece el renglón con error
+                raise BusinessValidationError(
+                    f"Cliente {client_order.id_client}: {error.message}",
+                    field=error.field,
+                    code=error.code,
+                ) from error
+
+        orders = [
+            self._add_order_with_items(
+                db,
+                id_client=client_order.id_client,
+                id_user_taker=id_user_taker,
+                items=items_by_client[client_order.id_client],
+                delivery_date=today,
+                estimated_delivery=obj_in.estimated_delivery,
+                id_user_vehicle=obj_in.id_user_vehicle,
+                id_route=id_route,
+                payment_method=client_order.payment_method,
+                invoice_type=self._resolve_invoice_type(
+                    client_order.invoice_type,
+                    is_registered=True,  # la ruta solo tiene clientes registrados
+                    requires_electronic=orderable[client_order.id_client],
+                ),
+                observations=client_order.observations,
+            )
+            for client_order in obj_in.orders
+        ]
+        db.commit()
+        for order in orders:
+            db.refresh(order)
+        return orders
+
+    # Consecutivo del día de entrega ("001", "002", ...). Lo asigna el servidor,
+    # nunca el cliente; los pedidos de otros días conservan el número que
+    # recibieron. Va por día de entrega para que el tablero de un día no repita PO.
+    def _next_purchase_order(self, db: Session, day: date) -> str:
+        number = order_repository.next_daily_number(db, day)
+        if number > MAX_DAILY_ORDERS:
+            # La excepción revierte la transacción, incluido el incremento
+            raise BusinessRuleViolationError(
+                f"Se alcanzó el máximo de {MAX_DAILY_ORDERS} pedidos para el día "
+                f"{day.isoformat()}.",
+                rule_code="DAILY_ORDER_LIMIT",
+            )
+        return f"{number:03d}"
+
+    # Marcar pdido como despachado
+    def dispatch_order(self, db: Session, id_order: int) -> Order:
+        order = self.get_for_update(db, id_order)
+        self._ensure_dispatchable(order)
+
+        order.state = OrderState.DISPATCHED
+        order.dispatch_time = datetime.now(BOGOTA_TZ).time()
+
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+        return order
+
+    # Despacho múltiple (p. ej. los pedidos de una ruta con un mismo domiciliario).
+    # Todo o nada: si algún pedido no se puede despachar no se despacha ninguno y
+    # el error trae cada PO con su motivo. Que sean de una sola ruta y un solo
+    # domiciliario lo resuelve el frontend al filtrar.
+    def dispatch_batch(self, db: Session, ids: list[int]) -> list[Order]:
+        orders = order_repository.get_many_for_update(db, ids)
+        found = {order.id_order for order in orders}
+        failures = [
+            {
+                "id_order": id_order,
+                "purchase_order": None,
+                "reason": "El pedido no existe.",
+            }
+            for id_order in sorted(set(ids) - found)
+        ]
+        for order in orders:
+            try:
+                self._ensure_dispatchable(order)
+            except BusinessValidationError as exc:
+                failures.append(
+                    {
+                        "id_order": order.id_order,
+                        "purchase_order": order.purchase_order,
+                        "reason": exc.message,
+                    }
+                )
+        if failures:
+            raise BusinessValidationError(
+                "No se despachó ningún pedido: hay pedidos que no se pueden "
+                "despachar.",
+                field="ids",
+                code="ORDER_BATCH_NOT_DISPATCHABLE",
+                details=failures,
+            )
+
+        dispatch_time = datetime.now(BOGOTA_TZ).time()
+        for order in orders:
+            order.state = OrderState.DISPATCHED
+            order.dispatch_time = dispatch_time
+        db.commit()
+        for order in orders:
+            db.refresh(order)
+        return orders
+
+    # Regla común del despacho individual y el múltiple: solo PENDING y no
+    # programado para un día posterior
+    @staticmethod
+    def _ensure_dispatchable(order: Order) -> None:
+        if order.state != OrderState.PENDING:
+            raise BusinessValidationError(
+                f"Solo se pueden despachar pedidos en estado 'PENDING'. "
+                f"Estado actual: '{order.state.value}'.",
+                field="state",
+            )
+
+        if order.delivery_date > today_bogota():
+            raise BusinessValidationError(
+                "El pedido está programado para el "
+                f"{order.delivery_date.isoformat()}; no se puede despachar antes "
+                "de ese día.",
+                field="delivery_date",
+                code="ORDER_SCHEDULED",
+            )
+
+    # Cancelar un pedido PENDING o DISPATCHED (un DELIVERED ya no se cancela). No
+    # borra nada: conserva PO, productos, ruta y dispatch_time; este último indica
+    # que se canceló después de despachar (listado informativo del cierre).
+    def cancel_order(
+        self, db: Session, id_order: int, data: OrderCancelRequest, id_user: int
+    ) -> Order:
+        order = self.get_for_update(db, id_order)
+
+        if order.state not in (OrderState.PENDING, OrderState.DISPATCHED):
+            raise BusinessValidationError(
+                "Solo se pueden cancelar pedidos pendientes o despachados. "
+                f"Estado actual: '{order.state.value}'.",
+                field="state",
+                code="ORDER_NOT_CANCELLABLE",
+            )
+
+        order.state = OrderState.CANCELLED
+        order.cancel_reason = data.cancel_reason
+        order.cancel_note = data.cancel_note
+        order.cancelled_at = datetime.now(BOGOTA_TZ)
+        order.id_user_canceller = id_user
+
+        db.commit()
+        db.refresh(order)
+        return order
+
+    # Marcar pdido como entregado
+    def deliver_order(self, db: Session, id_order: int) -> Order:
+        order = self.get_for_update(db, id_order)
+
+        if order.state != OrderState.DISPATCHED:
+            raise BusinessValidationError(
+                f"Solo se pueden marcar como entregados los pedidos en estado "
+                f"'DISPATCHED'. Estado actual: '{order.state.value}'.",
+                field="state",
+            )
+
+        order.state = OrderState.DELIVERED
+        order.delivery_time = datetime.now(BOGOTA_TZ).time()
+
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+        return order
+
+    def _validate_items(self, db: Session, items: list[OrderItemInput]) -> None:
+        self._ensure_no_duplicate_products(items)
+        for item in items:
+            self._ensure_reference(
+                db,
+                product_repository,
+                item.id_product,
+                field="id_product",
+                label="Producto",
+            )
+
+    def _priced_route_items(
+        self,
+        id_client: int,
+        items: list[RouteOrderItemInput],
+        agreed: dict[tuple[int, int], Decimal],
+    ) -> list[OrderItemInput]:
+        """Renglones de un pedido de ruta con el precio especial del cliente.
+        Solo se aceptan productos activos con precio especial para ese cliente."""
+        self._ensure_no_duplicate_products(items)
+        missing = [
+            i.id_product for i in items if (id_client, i.id_product) not in agreed
+        ]
+        if missing:
+            raise BusinessValidationError(
+                f"Estos productos no tienen precio especial para el cliente o están "
+                f"inactivos (ID: {_ids(missing)}). Agrégalos después editando el "
+                "pedido.",
+                field="id_product",
+                code="NO_SPECIAL_PRICE",
+            )
+        return [
+            OrderItemInput(
+                id_product=i.id_product,
+                cant=i.cant,
+                unit_price=agreed[(id_client, i.id_product)],
+            )
+            for i in items
+        ]
+
+    @staticmethod
+    def _ensure_no_duplicate_products(
+        items: list[OrderItemInput] | list[OrderItemSync] | list[RouteOrderItemInput],
+    ) -> None:
+        """Un producto solo puede aparecer en un renglón del pedido."""
+        seen: set[int] = set()
+        duplicated: list[int] = []
+        for item in items:
+            if item.id_product in seen and item.id_product not in duplicated:
+                duplicated.append(item.id_product)
+            seen.add(item.id_product)
+        if duplicated:
+            ids = ", ".join(str(i) for i in duplicated)
+            raise BusinessValidationError(
+                f"Producto repetido en el pedido (ID: {ids}). "
+                "Agrupa la cantidad en un solo renglón.",
+                field="id_product",
+                code="DUPLICATE_PRODUCT",
+            )
+
+    # Actualiacion de Pedido (Quitar, Agregar, Modificar -> Productos)
+    def sync_items(
+        self,
+        db: Session,
+        *,
+        id_order: int,
+        items: list[OrderItemSync],
+        id_user: int,
+    ) -> Order:
+        order = self.get_for_update(db, id_order)  # 404 si no existe; bloquea la fila
+
+        if order.state != OrderState.PENDING:
+            raise BusinessRuleViolationError(
+                f"No se pueden modificar los productos de un pedido en estado "
+                f"'{order.state.value}'. Solo se permite mientras está 'PENDING'."
+            )
+
+        # Antes de tocar nada: la lista final no puede repetir productos
+        self._ensure_no_duplicate_products(items)
+
+        existing_details = {d.id_order_detail: d for d in order.order_details}
+        # Para la auditoría: los productos antes de editar, como (producto,
+        # cantidad, precio). Si la lista final es igual, no cuenta como edición.
+        before = _items_snapshot(existing_details.values())
+        incoming_ids = {
+            i.id_order_detail for i in items if i.id_order_detail is not None
+        }
+
+        # Validar que todo id_order_detail enviado exista y pertenezca a ESTE pedido
+        for item in items:
+            if (
+                item.id_order_detail is not None
+                and item.id_order_detail not in existing_details
+            ):
+                raise BusinessValidationError(
+                    f"El detalle {item.id_order_detail} no pertenece a este pedido.",
+                    field="id_order_detail",
+                )
+
+        # Eliminar los que ya no vienen en la lista
+        for detail_id, detail in existing_details.items():
+            if detail_id not in incoming_ids:
+                order.order_details.remove(detail)
+                db.delete(detail)
+
+        total = Decimal("0")  # noqa: FURB157
+        for item in items:
+            # Un renglón que el pedido ya tenía conserva su producto aunque este se
+            # haya desactivado después (se le puede cambiar cantidad o precio, o
+            # quitarlo). Un producto nuevo en el pedido, o un renglón que cambia de
+            # producto, sí debe existir y estar activo.
+            kept = (
+                item.id_order_detail is not None
+                and existing_details[item.id_order_detail].id_product == item.id_product
+            )
+            if not kept:
+                self._ensure_reference(
+                    db,
+                    product_repository,
+                    item.id_product,
+                    field="id_product",
+                    label="Producto",
+                )
+            subtotal = item.unit_price * item.cant
+
+            if item.id_order_detail is not None:
+                detail = existing_details[item.id_order_detail]
+                detail.id_product = item.id_product
+                detail.cant = item.cant
+                detail.unit_price = item.unit_price
+                detail.subtotal = subtotal
+                db.add(detail)
+            else:
+                order_detail_repository.add(
+                    db,
+                    obj_in_data={
+                        "id_order": order.id_order,
+                        "id_product": item.id_product,
+                        "cant": item.cant,
+                        "unit_price": item.unit_price,
+                        "subtotal": subtotal,
+                    },
+                )
+            total += subtotal
+
+        order.order_total = total
+        if _items_snapshot(items) != before:
+            # Solo la edición de productos (cantidades, precios, agregar o quitar)
+            # registra quién y cuándo; el PATCH y la cancelación no la tocan
+            order.items_updated_at = func.now()  # type: ignore[assignment]
+            order.id_user_items_updater = id_user
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+        return order
+
+    _FINAL_STATES = (OrderState.DELIVERED, OrderState.CANCELLED)
+
+    # PATCH (conductor y hora estimada): mismo flujo que BaseService.update, pero
+    # bloqueando la fila, porque la validación depende del estado del pedido.
+    def update(self, db: Session, *, id: int, obj_in: OrderUpdate) -> Order:
+        db_obj = self.get_for_update(db, id)
+        self._validate_before_update(db, obj_in, db_obj)
+        new_date = obj_in.delivery_date
+        if (
+            "delivery_date" in obj_in.model_fields_set
+            and new_date is not None
+            and new_date != db_obj.delivery_date
+        ):
+            # Cambia de día: recibe el consecutivo del día de destino (conservar
+            # el anterior podría repetir un PO en el tablero de ese día)
+            db_obj.purchase_order = self._next_purchase_order(db, new_date)
+        return self.repository.update(db, db_obj=db_obj, obj_in=obj_in)
+
+    def _validate_before_update(
+        self, db: Session, obj_in: OrderUpdate, existing: Order
+    ) -> None:
+        super()._validate_before_update(db, obj_in, existing)
+        sent = obj_in.model_fields_set
+        new_vehicle = obj_in.id_user_vehicle
+        if (
+            "id_user_vehicle" in sent
+            and new_vehicle is not None
+            and new_vehicle != existing.id_user_vehicle
+        ):
+            # Solo se valida si cambia: un pedido conserva su domiciliario aunque
+            # este se haya desactivado después
+            self._ensure_vehicle(db, new_vehicle)
+        if existing.state in self._FINAL_STATES:
+            raise BusinessValidationError(
+                f"No se puede modificar un pedido en estado '{existing.state.value}'.",
+                field=next(
+                    (
+                        name
+                        for name in (
+                            "estimated_delivery",
+                            "delivery_date",
+                            "payment_method",
+                            "invoice_type",
+                            "observations",
+                        )
+                        if name in sent
+                    ),
+                    "id_user_vehicle",
+                ),
+            )
+        # Método de pago, tipo de factura y observación: editables en PENDING y
+        # DISPATCHED (los estados finales ya se rechazaron arriba)
+        for name, label in (
+            ("payment_method", "método de pago"),
+            ("invoice_type", "tipo de factura"),
+        ):
+            if name in sent and getattr(obj_in, name) is None:
+                raise BusinessValidationError(
+                    f"El {label} del pedido no se puede quitar.",
+                    field=name,
+                    code="REQUIRED_FIELD",
+                )
+        new_invoice = obj_in.invoice_type
+        if new_invoice is not None and new_invoice != existing.invoice_type:
+            self._resolve_invoice_type(
+                new_invoice,
+                is_registered=existing.client.is_registered,
+                requires_electronic=existing.client.requires_electronic_invoice,
+            )
+        if "delivery_date" in sent:
+            if obj_in.delivery_date is None:
+                raise BusinessValidationError(
+                    "El día de entrega no se puede quitar.",
+                    field="delivery_date",
+                    code="DELIVERY_DATE_REQUIRED",
+                )
+            if existing.state != OrderState.PENDING:
+                raise BusinessValidationError(
+                    "El día de entrega solo se puede cambiar en pedidos pendientes "
+                    f"(estado actual: '{existing.state.value}').",
+                    field="delivery_date",
+                )
+            if obj_in.delivery_date != existing.delivery_date:
+                self._resolve_delivery_date(obj_in.delivery_date)
+        # El conductor se puede cambiar hasta que el pedido sea final, pero la
+        # hora estimada solo tiene sentido antes de despachar.
+        if "estimated_delivery" in sent and existing.state != OrderState.PENDING:
+            raise BusinessValidationError(
+                "La hora estimada solo se puede cambiar en pedidos pendientes "
+                f"(estado actual: '{existing.state.value}').",
+                field="estimated_delivery",
+            )
+
+
+def _ids(values: list[int]) -> str:
+    return ", ".join(str(v) for v in values)
+
+
+def _person_name(user) -> str | None:
+    """Nombre y apellido de la persona de un usuario (None si no hay usuario)."""
+    if user is None:
+        return None
+    return f"{user.person.name} {user.person.last_name}"
+
+
+def _in_bogota(value: datetime | None) -> datetime | None:
+    return value.astimezone(BOGOTA_TZ) if value is not None else None
+
+
+def _items_snapshot(items) -> list[tuple[int, int, Decimal]]:
+    """Productos de un pedido como (producto, cantidad, precio), ordenados: sirve
+    igual para los renglones guardados y para la lista que llega al editar."""
+    return sorted((i.id_product, i.cant, Decimal(i.unit_price)) for i in items)
+
+
+order_service = OrderService()
